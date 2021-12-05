@@ -22,7 +22,7 @@ const (
 	addColumnCHTemplate       = `ALTER TABLE "%s"."%s" %s ADD COLUMN %s`
 	insertCHTemplate          = `INSERT INTO "%s"."%s" (%s) VALUES %s`
 	deleteQueryChTemplate     = `ALTER TABLE %s.%s DELETE WHERE %s`
-	dropTableCHTemplate       = `DROP TABLE "%s"."%s"`
+	dropTableCHTemplate       = `DROP TABLE "%s"."%s" %s`
 	onClusterCHClauseTemplate = ` ON CLUSTER "%s" `
 	columnCHNullableTemplate  = ` Nullable(%s) `
 
@@ -121,7 +121,11 @@ func (chc *ClickHouseConfig) Validate() error {
 	}
 
 	for _, dsn := range chc.Dsns {
-		if !strings.HasPrefix(dsn, "http") {
+		if dsn == "" {
+			return errors.New("DSNs values can't be empty")
+		}
+
+		if !strings.HasPrefix(strings.TrimSpace(dsn), "http") {
 			return errors.New("DSNs must have http:// or https:// prefix")
 		}
 	}
@@ -491,7 +495,7 @@ func (ch *ClickHouse) DropTable(table *Table) error {
 		return err
 	}
 
-	query := fmt.Sprintf(dropTableCHTemplate, ch.database, table.Name)
+	query := fmt.Sprintf(dropTableCHTemplate, ch.database, table.Name, ch.getOnClusterClause())
 	ch.queryLogger.LogDDL(query)
 
 	_, err = wrappedTx.tx.ExecContext(ch.ctx, query)
