@@ -1,14 +1,18 @@
 package events
 
 import (
+	"errors"
 	"fmt"
+	"time"
+
 	"github.com/jitsucom/jitsu/server/events/internal"
 	"github.com/jitsucom/jitsu/server/logging"
 	"github.com/jitsucom/jitsu/server/queue"
 	"github.com/jitsucom/jitsu/server/safego"
 	"github.com/jitsucom/jitsu/server/timestamp"
-	"time"
 )
+
+var ErrQueueClosed = errors.New("queue is closed")
 
 // TimedEventBuilder creates and returns a new *events.TimedEvent (must be pointer).
 // This is used on deserialization
@@ -19,6 +23,7 @@ func TimedEventBuilder() interface{} {
 //NativeQueue is a event queue implementation by Jitsu
 type NativeQueue struct {
 	namespace  string
+	subsystem  string
 	identifier string
 	queue      queue.Queue
 
@@ -26,7 +31,7 @@ type NativeQueue struct {
 	closed          chan struct{}
 }
 
-func NewNativeQueue(namespace, identifier string, underlyingQueue queue.Queue) (Queue, error) {
+func NewNativeQueue(namespace, subsystem, identifier string, underlyingQueue queue.Queue) (Queue, error) {
 	var metricsReporter internal.MetricReporter
 	if underlyingQueue.Type() == queue.RedisType {
 		metricsReporter = &internal.SharedQueueMetricReporter{}
@@ -34,11 +39,12 @@ func NewNativeQueue(namespace, identifier string, underlyingQueue queue.Queue) (
 		metricsReporter = &internal.ServerMetricReporter{}
 	}
 
-	metricsReporter.SetMetrics(identifier, int(underlyingQueue.Size()))
+	metricsReporter.SetMetrics(subsystem, identifier, int(underlyingQueue.Size()))
 
 	nq := &NativeQueue{
 		queue:           underlyingQueue,
 		namespace:       namespace,
+		subsystem:       subsystem,
 		identifier:      identifier,
 		metricsReporter: metricsReporter,
 		closed:          make(chan struct{}, 1),
@@ -56,10 +62,10 @@ func (q *NativeQueue) startMonitor() {
 		case <-q.closed:
 			return
 		case <-metricsTicker.C:
-			q.metricsReporter.SetMetrics(q.identifier, int(q.queue.Size()))
+			q.metricsReporter.SetMetrics(q.subsystem, q.identifier, int(q.queue.Size()))
 		case <-debugTicker.C:
 			size := q.queue.Size()
-			logging.Infof("[queue: %s_%s] current size: %d", q.namespace, q.identifier, size)
+			logging.Infof("[queue: %s_%s_%s] current size: %d", q.namespace, q.subsystem, q.identifier, size)
 		}
 	}
 }
@@ -80,7 +86,7 @@ func (q *NativeQueue) ConsumeTimed(payload map[string]interface{}, t time.Time, 
 		return
 	}
 
-	q.metricsReporter.EnqueuedEvent(q.identifier)
+	q.metricsReporter.EnqueuedEvent(q.subsystem, q.identifier)
 }
 
 func (q *NativeQueue) DequeueBlock() (Event, time.Time, string, error) {
@@ -93,7 +99,7 @@ func (q *NativeQueue) DequeueBlock() (Event, time.Time, string, error) {
 		return nil, time.Time{}, "", err
 	}
 
-	q.metricsReporter.DequeuedEvent(q.identifier)
+	q.metricsReporter.DequeuedEvent(q.subsystem, q.identifier)
 
 	te, ok := ite.(*TimedEvent)
 	if !ok {
@@ -105,6 +111,11 @@ func (q *NativeQueue) DequeueBlock() (Event, time.Time, string, error) {
 
 //Close closes underlying queue
 func (q *NativeQueue) Close() error {
-	close(q.closed)
-	return q.queue.Close()
+	select {
+	case <-q.closed:
+		return nil
+	default:
+		close(q.closed)
+		return q.queue.Close()
+	}
 }

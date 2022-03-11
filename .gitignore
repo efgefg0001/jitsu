@@ -21,11 +21,10 @@ ui-dev-compose/redis-insights
 
 .idea/
 .run/
-package-lock.json
-package.json
 server/server
 server/logs
 server/venv
+configurator/backend/openapi/*
 
 configurator/build/*
 server/venv

@@ -1,19 +1,19 @@
 package adapters
 
 import (
+	"encoding/json"
 	"fmt"
+	"github.com/jitsucom/jitsu/server/schema"
 	"github.com/jitsucom/jitsu/server/templates"
 	"github.com/jitsucom/jitsu/server/utils"
 	"github.com/mitchellh/mapstructure"
 )
 
-const JitsuEnvelopParameter = "JITSU_ENVELOP"
-
 type Envelop struct {
 	URL     string            `mapstructure:"url"`
 	Method  string            `mapstructure:"method"`
 	Headers map[string]string `mapstructure:"headers"`
-	Body    string            `mapstructure:"body"`
+	Body    interface{}       `mapstructure:"body"`
 }
 
 //HTTPRequestFactory is a factory for creating http.Request from input event object
@@ -40,6 +40,7 @@ func NewWebhookRequestFactory(destinationID, destinationType, httpMethod, urlTmp
 
 	bodyTmpl, err := templates.SmartParse("body", bodyTmplStr, templateFunctions)
 	if err != nil {
+		urlTmpl.Close()
 		return nil, fmt.Errorf("Error parsing body template [%s]: %v", bodyTmplStr, err)
 	}
 	return &WebhookRequestFactory{
@@ -62,11 +63,11 @@ func (wrf *WebhookRequestFactory) Create(object map[string]interface{}) (req *Re
 	var body []byte
 	headers := make(map[string]string)
 	var envelop Envelop
-	envl, ok := object[JitsuEnvelopParameter]
+	envl, ok := object[schema.JitsuEnvelopParameter]
 	if ok {
-		delete(object, JitsuEnvelopParameter)
+		delete(object, schema.JitsuEnvelopParameter)
 		if err := mapstructure.Decode(envl, &envelop); err != nil {
-			return nil, fmt.Errorf("cannot parse %s: %v", JitsuEnvelopParameter, err)
+			return nil, fmt.Errorf("cannot parse %s: %v", schema.JitsuEnvelopParameter, err)
 		}
 	}
 	if envelop.URL == "" {
@@ -82,7 +83,7 @@ func (wrf *WebhookRequestFactory) Create(object map[string]interface{}) (req *Re
 	utils.StringMapPutAll(headers, wrf.headers)
 	utils.StringMapPutAll(headers, envelop.Headers)
 
-	if envelop.Body == "" {
+	if envelop.Body == nil {
 		rawBody, err := wrf.bodyTmpl.ProcessEvent(object)
 		if err != nil {
 			return nil, fmt.Errorf("Error executing body template: %v", err)
@@ -92,7 +93,17 @@ func (wrf *WebhookRequestFactory) Create(object map[string]interface{}) (req *Re
 			return nil, err
 		}
 	} else {
-		body = []byte(envelop.Body)
+		switch b := envelop.Body.(type) {
+		case string:
+			body = []byte(b)
+		case []byte:
+			body = b
+		default:
+			body, err = json.Marshal(b)
+			if err != nil {
+				return nil, fmt.Errorf("cannot marshal JITSU_ENVELOP body: %v", err)
+			}
+		}
 	}
 
 	return &Request{

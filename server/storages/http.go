@@ -15,34 +15,31 @@ import (
 type HTTPStorage struct {
 	Abstract
 
-	tableHelper     *TableHelper
-	streamingWorker *StreamingWorker
-
 	adapter adapters.Adapter
 }
 
 //Insert sends event into adapters.Adapter
 func (h *HTTPStorage) Insert(eventContext *adapters.EventContext) error {
-	return h.adapter.Insert(eventContext)
+	return h.adapter.Insert(adapters.NewSingleInsertContext(eventContext))
 }
 
 func (h *HTTPStorage) DryRun(payload events.Event) ([][]adapters.TableField, error) {
-	return dryRun(payload, h.processor, h.tableHelper)
+	return nil, nil
 }
 
 //Store isn't supported
-func (h *HTTPStorage) Store(fileName string, objects []map[string]interface{}, alreadyUploadedTables map[string]bool) (map[string]*StoreResult, *events.FailedEvents, *events.SkippedEvents, error) {
+func (h *HTTPStorage) Store(fileName string, objects []map[string]interface{}, alreadyUploadedTables map[string]bool, needCopyEvent bool) (map[string]*StoreResult, *events.FailedEvents, *events.SkippedEvents, error) {
 	return nil, nil, nil, fmt.Errorf("%s doesn't support Store() func", h.Type())
 }
 
 //SyncStore isn't supported
-func (h *HTTPStorage) SyncStore(overriddenDataSchema *schema.BatchHeader, objects []map[string]interface{}, timeIntervalValue string, cacheTable bool) error {
+func (h *HTTPStorage) SyncStore(overriddenDataSchema *schema.BatchHeader, objects []map[string]interface{}, timeIntervalValue string, cacheTable bool, needCopyEvent bool) error {
 	return fmt.Errorf("%s doesn't support Store() func", h.Type())
 }
 
 //Update isn't supported
-func (h *HTTPStorage) Update(objects []map[string]interface{}) error {
-	return fmt.Errorf("%s doesn't support Store() func", h.Type())
+func (h *HTTPStorage) Update(eventContext *adapters.EventContext) error {
+	return fmt.Errorf("%s doesn't support Update() func", h.Type())
 }
 
 //GetUsersRecognition returns disabled users recognition configuration
@@ -67,13 +64,15 @@ func (h *HTTPStorage) Type() string {
 
 //Close closes adapter, fallback logger and streaming worker
 func (h *HTTPStorage) Close() (multiErr error) {
-	if err := h.adapter.Close(); err != nil {
-		multiErr = multierror.Append(multiErr, fmt.Errorf("[%s] Error closing %s client: %v", h.ID(), h.Type(), err))
-	}
-
 	if h.streamingWorker != nil {
 		if err := h.streamingWorker.Close(); err != nil {
 			multiErr = multierror.Append(multiErr, fmt.Errorf("[%s] Error closing streaming worker: %v", h.ID(), err))
+		}
+	}
+
+	if h.adapter != nil {
+		if err := h.adapter.Close(); err != nil {
+			multiErr = multierror.Append(multiErr, fmt.Errorf("[%s] Error closing %s client: %v", h.ID(), h.Type(), err))
 		}
 	}
 

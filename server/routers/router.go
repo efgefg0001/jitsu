@@ -1,59 +1,82 @@
 package routers
 
 import (
-	"github.com/jitsucom/jitsu/server/geo"
-	"github.com/jitsucom/jitsu/server/multiplexing"
-	"github.com/jitsucom/jitsu/server/plugins"
-	"github.com/jitsucom/jitsu/server/wal"
+	"github.com/jitsucom/jitsu/server/config"
 	"net/http"
 	"net/http/pprof"
+	"runtime/debug"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jitsucom/jitsu/server/appconfig"
 	"github.com/jitsucom/jitsu/server/caching"
-	"github.com/jitsucom/jitsu/server/cluster"
+	"github.com/jitsucom/jitsu/server/coordination"
 	"github.com/jitsucom/jitsu/server/destinations"
 	"github.com/jitsucom/jitsu/server/events"
 	"github.com/jitsucom/jitsu/server/fallback"
+	"github.com/jitsucom/jitsu/server/geo"
 	"github.com/jitsucom/jitsu/server/handlers"
+	"github.com/jitsucom/jitsu/server/logging"
 	"github.com/jitsucom/jitsu/server/meta"
 	"github.com/jitsucom/jitsu/server/metrics"
 	"github.com/jitsucom/jitsu/server/middleware"
+	"github.com/jitsucom/jitsu/server/multiplexing"
+	"github.com/jitsucom/jitsu/server/plugins"
 	"github.com/jitsucom/jitsu/server/sources"
 	"github.com/jitsucom/jitsu/server/synchronization"
 	"github.com/jitsucom/jitsu/server/system"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/jitsucom/jitsu/server/wal"
+	"github.com/penglongli/gin-metrics/ginmetrics"
 	"github.com/spf13/viper"
 )
 
-func SetupRouter(adminToken string, metaStorage meta.Storage, destinations *destinations.Service, sourcesService *sources.Service, taskService *synchronization.TaskService,
-	fallbackService *fallback.Service, clusterManager cluster.Manager, eventsCache *caching.EventsCache, systemService *system.Service,
-	segmentEndpointFieldMapper, segmentCompatEndpointFieldMapper events.Mapper, processorHolder *events.ProcessorHolder,
-	multiplexingService *multiplexing.Service, walService *wal.Service, geoService *geo.Service, pluginsRepository plugins.PluginsRepository) *gin.Engine {
+func SetupRouter(adminToken string, metaStorage meta.Storage, destinations *destinations.Service, sourcesService *sources.Service,
+	taskService *synchronization.TaskService, fallbackService *fallback.Service, coordinationService *coordination.Service,
+	eventsCache *caching.EventsCache, systemService *system.Service, segmentEndpointFieldMapper, segmentCompatEndpointFieldMapper events.Mapper,
+	processorHolder *events.ProcessorHolder, multiplexingService *multiplexing.Service, walService *wal.Service, geoService *geo.Service,
+	pluginsRepository plugins.PluginsRepository, userRecognition *config.UsersRecognition) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 
 	router := gin.New() //gin.Default()
-	router.Use(gin.Recovery())
+	if metrics.Enabled() {
+		// get global Monitor object
+		m := ginmetrics.GetMonitor()
+		m.SetSlowTime(5)
+		// set request duration, default {0.1, 0.3, 1.2, 5, 10}
+		// used to p95, p99
+		m.SetDuration([]float64{0.1, 0.3, 1.2, 5, 10})
+		m.UseWithoutExposingEndpoint(router)
+	}
+
+	router.Use(gin.RecoveryWithWriter(logging.GlobalLogsWriter, func(c *gin.Context, err interface{}) {
+		logging.SystemErrorf("Panic:\n%s\n%s", err, string(debug.Stack()))
+		c.AbortWithStatus(http.StatusInternalServerError)
+	}))
+
+	if viper.GetBool("server.log_http_errors") {
+		router.Use(middleware.ErrorLogWriter)
+	}
 
 	router.GET("/ping", func(c *gin.Context) {
 		c.String(http.StatusOK, "pong")
 	})
 
+	maxEventSize := viper.GetInt("server.max_event_size")
+
 	publicURL := viper.GetString("server.public_url")
 	configuratorURN := viper.GetString("server.configurator_urn")
 
 	rootPathHandler := handlers.NewRootPathHandler(systemService, viper.GetString("server.static_files_dir"), configuratorURN,
-		viper.GetBool("server.disable_welcome_page"), viper.GetBool("server.configurator_redirect_https"))
+		viper.GetBool("server.disable_welcome_page"), viper.GetBool("server.configurator_redirect_https"), viper.GetBool("server.disable_signature"))
 	router.GET("/", rootPathHandler.Handler)
 
 	staticHandler := handlers.NewStaticHandler(viper.GetString("server.static_files_dir"), publicURL)
 	router.GET("/s/:filename", staticHandler.Handler)
 	router.GET("/t/:filename", staticHandler.Handler)
 
-	jsEventHandler := handlers.NewEventHandler(walService, multiplexingService, eventsCache, events.NewJitsuParser(), processorHolder.GetJSPreprocessor(), destinations, geoService)
-	apiEventHandler := handlers.NewEventHandler(walService, multiplexingService, eventsCache, events.NewJitsuParser(), processorHolder.GetAPIPreprocessor(), destinations, geoService)
-	segmentHandler := handlers.NewEventHandler(walService, multiplexingService, eventsCache, events.NewSegmentParser(segmentEndpointFieldMapper, appconfig.Instance.GlobalUniqueIDField), processorHolder.GetSegmentPreprocessor(), destinations, geoService)
-	segmentCompatHandler := handlers.NewEventHandler(walService, multiplexingService, eventsCache, events.NewSegmentCompatParser(segmentCompatEndpointFieldMapper, appconfig.Instance.GlobalUniqueIDField), processorHolder.GetSegmentPreprocessor(), destinations, geoService)
+	jsEventHandler := handlers.NewEventHandler(walService, multiplexingService, eventsCache, events.NewJitsuParser(maxEventSize), processorHolder.GetJSPreprocessor(), destinations, geoService)
+	apiEventHandler := handlers.NewEventHandler(walService, multiplexingService, eventsCache, events.NewJitsuParser(maxEventSize), processorHolder.GetAPIPreprocessor(), destinations, geoService)
+	segmentHandler := handlers.NewEventHandler(walService, multiplexingService, eventsCache, events.NewSegmentParser(segmentEndpointFieldMapper, appconfig.Instance.GlobalUniqueIDField, maxEventSize), processorHolder.GetSegmentPreprocessor(), destinations, geoService)
+	segmentCompatHandler := handlers.NewEventHandler(walService, multiplexingService, eventsCache, events.NewSegmentCompatParser(segmentCompatEndpointFieldMapper, appconfig.Instance.GlobalUniqueIDField, maxEventSize), processorHolder.GetSegmentPreprocessor(), destinations, geoService)
 
 	taskHandler := handlers.NewTaskHandler(taskService, sourcesService)
 	fallbackHandler := handlers.NewFallbackHandler(fallbackService)
@@ -76,6 +99,7 @@ func SetupRouter(adminToken string, metaStorage meta.Storage, destinations *dest
 		apiV1.POST("/events", middleware.TokenFuncAuth(jsEventHandler.PostHandler, appconfig.Instance.AuthorizationService.GetClientOrigins, ""))
 		//server endpoint
 		apiV1.POST("/s2s/event", middleware.TokenTwoFuncAuth(apiEventHandler.PostHandler, appconfig.Instance.AuthorizationService.GetServerOrigins, appconfig.Instance.AuthorizationService.GetClientOrigins, "The token isn't a server secret token. Please use an s2s integration token"))
+		apiV1.POST("/s2s/event/", middleware.TokenTwoFuncAuth(apiEventHandler.PostHandler, appconfig.Instance.AuthorizationService.GetServerOrigins, appconfig.Instance.AuthorizationService.GetClientOrigins, "The token isn't a server secret token. Please use an s2s integration token"))
 		apiV1.POST("/s2s/events", middleware.TokenTwoFuncAuth(apiEventHandler.PostHandler, appconfig.Instance.AuthorizationService.GetServerOrigins, appconfig.Instance.AuthorizationService.GetClientOrigins, "The token isn't a server secret token. Please use an s2s integration token"))
 		//Segment API
 		apiV1.POST("/segment/v1/batch", middleware.TokenFuncAuth(segmentHandler.PostHandler, appconfig.Instance.AuthorizationService.GetServerOrigins, ""))
@@ -93,7 +117,7 @@ func SetupRouter(adminToken string, metaStorage meta.Storage, destinations *dest
 
 		apiV1.GET("/geo_data_resolvers/editions", adminTokenMiddleware.AdminAuth(geoDataResolverHandler.EditionsHandler))
 		apiV1.POST("/geo_data_resolvers/test", adminTokenMiddleware.AdminAuth(geoDataResolverHandler.TestHandler))
-		apiV1.POST("/destinations/test", adminTokenMiddleware.AdminAuth(handlers.DestinationsHandler))
+		apiV1.POST("/destinations/test", adminTokenMiddleware.AdminAuth(handlers.NewDestinationsHandler(userRecognition).Handler))
 		apiV1.POST("/templates/evaluate", adminTokenMiddleware.AdminAuth(handlers.NewEventTemplateHandler(pluginsRepository, destinations.GetFactory()).Handler))
 
 		sourcesRoute := apiV1.Group("/sources")
@@ -114,7 +138,7 @@ func SetupRouter(adminToken string, metaStorage meta.Storage, destinations *dest
 		apiV1.GET("/tasks/:taskID/logs", adminTokenMiddleware.AdminAuth(taskHandler.TaskLogsHandler))
 		apiV1.POST("/tasks/:taskID/cancel", adminTokenMiddleware.AdminAuth(taskHandler.TaskCancelHandler))
 
-		apiV1.GET("/cluster", adminTokenMiddleware.AdminAuth(handlers.NewClusterHandler(clusterManager).Handler))
+		apiV1.GET("/cluster", adminTokenMiddleware.AdminAuth(handlers.NewClusterHandler(coordinationService).Handler))
 		apiV1.GET("/events/cache", adminTokenMiddleware.AdminAuth(jsEventHandler.GetHandler))
 
 		apiV1.GET("/fallback", adminTokenMiddleware.AdminAuth(fallbackHandler.GetHandler))
@@ -129,8 +153,8 @@ func SetupRouter(adminToken string, metaStorage meta.Storage, destinations *dest
 
 	router.POST("/api.:ignored", middleware.TokenFuncAuth(jsEventHandler.PostHandler, appconfig.Instance.AuthorizationService.GetClientOrigins, ""))
 
-	if metrics.Enabled {
-		router.GET("/prometheus", middleware.TokenAuth(gin.WrapH(promhttp.Handler()), adminToken))
+	if metrics.Exported {
+		router.GET("/prometheus", middleware.TokenAuth(gin.WrapH(metrics.Handler()), adminToken))
 	}
 
 	//Setup profiler

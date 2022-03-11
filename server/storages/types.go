@@ -28,18 +28,36 @@ const (
 	KafkaType           = "kafka"
 )
 
+type URSetup struct {
+	PKRequired bool
+}
+
+var (
+	UserRecognitionStorages = map[string]URSetup{
+		MySQLType:      {true},
+		PostgresType:   {true},
+		RedshiftType:   {true},
+		SnowflakeType:  {true},
+		ClickHouseType: {false},
+	}
+)
+
 //Storage is a destination representation
 type Storage interface {
 	io.Closer
 	DryRun(payload events.Event) ([][]adapters.TableField, error)
-	Store(fileName string, objects []map[string]interface{}, alreadyUploadedTables map[string]bool) (map[string]*StoreResult, *events.FailedEvents, *events.SkippedEvents, error)
-	SyncStore(overriddenDataSchema *schema.BatchHeader, objects []map[string]interface{}, timeIntervalValue string, cacheTable bool) error
-	Update(objects []map[string]interface{}) error
+	Store(fileName string, objects []map[string]interface{}, alreadyUploadedTables map[string]bool, needCopyEvent bool) (map[string]*StoreResult, *events.FailedEvents, *events.SkippedEvents, error)
+	SyncStore(overriddenDataSchema *schema.BatchHeader, objects []map[string]interface{}, timeIntervalValue string, cacheTable bool, needCopyEvent bool) error
+	storeTable(fdata *schema.ProcessedFile) (*adapters.Table, error)
+
+	//Update(object map[string]interface{}) error
 	Fallback(events ...*events.FailedEvent)
 	GetUsersRecognition() *UserRecognitionConfiguration
 	GetUniqueIDField() *identifiers.UniqueID
 	getAdapters() (adapters.SQLAdapter, *TableHelper)
 	Processor() *schema.Processor
+	Init(config *Config, impl Storage) error
+	Start(config *Config) error
 	ID() string
 	Type() string
 	IsStaging() bool
@@ -71,10 +89,10 @@ type UserRecognitionConfiguration struct {
 	AnonymousIDJSONPath      jsonutils.JSONPath
 	IdentificationJSONPathes *jsonutils.JSONPaths
 
-	enabled bool
+	Enabled bool
 }
 
 //IsEnabled returns true if not nil and enabled
 func (urc *UserRecognitionConfiguration) IsEnabled() bool {
-	return urc != nil && urc.enabled
+	return urc != nil && urc.Enabled
 }

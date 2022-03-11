@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
+
 	"github.com/jitsucom/jitsu/server/appconfig"
 	"github.com/jitsucom/jitsu/server/caching"
 	"github.com/jitsucom/jitsu/server/config"
-	"github.com/jitsucom/jitsu/server/enrichment"
+	"github.com/jitsucom/jitsu/server/coordination"
 	"github.com/jitsucom/jitsu/server/events"
 	"github.com/jitsucom/jitsu/server/geo"
 	"github.com/jitsucom/jitsu/server/identifiers"
@@ -15,9 +17,6 @@ import (
 	"github.com/jitsucom/jitsu/server/logevents"
 	"github.com/jitsucom/jitsu/server/logging"
 	"github.com/jitsucom/jitsu/server/meta"
-	"github.com/jitsucom/jitsu/server/schema"
-	"github.com/jitsucom/jitsu/server/typing"
-	"strings"
 )
 
 const (
@@ -51,18 +50,16 @@ type Config struct {
 	destinationID          string
 	destination            *config.DestinationConfig
 	usersRecognition       *UserRecognitionConfiguration
-	processor              *schema.Processor
+	geoService             *geo.Service
 	streamMode             bool
 	maxColumns             int
-	monitorKeeper          MonitorKeeper
+	coordinationService    *coordination.Service
 	eventQueue             events.Queue
 	eventsCache            *caching.EventsCache
 	loggerFactory          *logevents.Factory
 	queueFactory           *events.QueueFactory
 	pkFields               map[string]bool
-	sqlTypes               typing.SQLTypes
 	uniqueIDField          *identifiers.UniqueID
-	mappingsStyle          string
 	logEventPath           string
 	PostHandleDestinations []string
 }
@@ -98,7 +95,7 @@ type FactoryImpl struct {
 	ctx                 context.Context
 	logEventPath        string
 	geoService          *geo.Service
-	monitorKeeper       MonitorKeeper
+	coordinationService *coordination.Service
 	eventsCache         *caching.EventsCache
 	globalLoggerFactory *logevents.Factory
 	globalConfiguration *config.UsersRecognition
@@ -108,14 +105,14 @@ type FactoryImpl struct {
 }
 
 //NewFactory returns configured Factory
-func NewFactory(ctx context.Context, logEventPath string, geoService *geo.Service, monitorKeeper MonitorKeeper,
-	eventsCache *caching.EventsCache, globalLoggerFactory *logevents.Factory,
-	globalConfiguration *config.UsersRecognition, metaStorage meta.Storage, eventsQueueFactory *events.QueueFactory, maxColumns int) Factory {
+func NewFactory(ctx context.Context, logEventPath string, geoService *geo.Service, coordinationService *coordination.Service,
+	eventsCache *caching.EventsCache, globalLoggerFactory *logevents.Factory, globalConfiguration *config.UsersRecognition,
+	metaStorage meta.Storage, eventsQueueFactory *events.QueueFactory, maxColumns int) Factory {
 	return &FactoryImpl{
 		ctx:                 ctx,
 		logEventPath:        logEventPath,
 		geoService:          geoService,
-		monitorKeeper:       monitorKeeper,
+		coordinationService: coordinationService,
 		eventsCache:         eventsCache,
 		globalLoggerFactory: globalLoggerFactory,
 		globalConfiguration: globalConfiguration,
@@ -178,7 +175,7 @@ func (f *FactoryImpl) Configure(destinationID string, destination config.Destina
 		return nil, nil, err
 	}
 
-	eventQueue, err := f.eventsQueueFactory.CreateEventsQueue(destinationID)
+	eventQueue, err := f.eventsQueueFactory.CreateEventsQueue(destination.Type, destinationID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -207,124 +204,25 @@ func (f *FactoryImpl) Configure(destinationID string, destination config.Destina
 		logging.Infof("[%s] events caching is disabled", destinationID)
 	}
 
-	processor, sqlTypes, mappingsStyle, err := f.SetupProcessor(destinationID, destination)
-	if err != nil {
-		return nil, nil, err
-	}
-
 	storageConfig := &Config{
 		ctx:                    f.ctx,
 		destinationID:          destinationID,
 		destination:            &destination,
 		usersRecognition:       usersRecognition,
-		processor:              processor,
+		geoService:             f.geoService,
 		streamMode:             destination.Mode == StreamMode,
 		maxColumns:             maxColumns,
-		monitorKeeper:          f.monitorKeeper,
+		coordinationService:    f.coordinationService,
 		eventQueue:             eventQueue,
 		eventsCache:            f.eventsCache,
 		loggerFactory:          destinationLoggerFactory,
 		queueFactory:           f.eventsQueueFactory,
 		pkFields:               pkFields,
-		sqlTypes:               sqlTypes,
 		uniqueIDField:          uniqueIDField,
-		mappingsStyle:          mappingsStyle,
 		logEventPath:           f.logEventPath,
 		PostHandleDestinations: destination.PostHandleDestinations,
 	}
 	return storageType.createFunc, storageConfig, nil
-}
-
-func (f *FactoryImpl) SetupProcessor(destinationID string, destination config.DestinationConfig) (processor *schema.Processor, sqlTypes typing.SQLTypes, mappingsStyle string, err error) {
-	storageType, ok := StorageTypes[destination.Type]
-	if !ok {
-		return nil, nil, "", ErrUnknownDestination
-	}
-	var tableName string
-	var oldStyleMappings []string
-	var newStyleMapping *config.Mapping
-	mappingFieldType := config.Default
-	uniqueIDField := appconfig.Instance.GlobalUniqueIDField
-	if destination.DataLayout != nil {
-		mappingFieldType = destination.DataLayout.MappingType
-		oldStyleMappings = destination.DataLayout.Mapping
-		newStyleMapping = destination.DataLayout.Mappings
-		if destination.DataLayout.TableNameTemplate != "" {
-			tableName = destination.DataLayout.TableNameTemplate
-		}
-	}
-
-	if tableName == "" {
-		tableName = storageType.defaultTableName
-	}
-	if tableName == "" {
-		tableName = defaultTableName
-		logging.Infof("[%s] uses default table: %s", destinationID, tableName)
-	}
-
-	if len(destination.Enrichment) == 0 {
-		logging.Warnf("[%s] doesn't have enrichment rules", destinationID)
-	} else {
-		logging.Infof("[%s] configured enrichment rules:", destinationID)
-	}
-
-	//default enrichment rules
-	enrichmentRules := []enrichment.Rule{
-		enrichment.CreateDefaultJsIPRule(f.geoService, destination.GeoDataResolverID),
-		enrichment.DefaultJsUaRule,
-	}
-
-	// ** Enrichment rules **
-	for _, ruleConfig := range destination.Enrichment {
-		logging.Infof("[%s] %s", destinationID, ruleConfig.String())
-
-		rule, err := enrichment.NewRule(ruleConfig, f.geoService, destination.GeoDataResolverID)
-		if err != nil {
-			return nil, nil, "", fmt.Errorf("Error creating enrichment rule [%s]: %v", ruleConfig.String(), err)
-		}
-
-		enrichmentRules = append(enrichmentRules, rule)
-	}
-
-	// ** Mapping rules **
-	if len(oldStyleMappings) > 0 {
-		logging.Warnf("\n\t ** [%s] DEPRECATED mapping configuration. Read more about new configuration schema: https://jitsu.com/docs/configuration/schema-and-mappings **\n", destinationID)
-		var convertErr error
-		newStyleMapping, convertErr = schema.ConvertOldMappings(mappingFieldType, oldStyleMappings)
-		if convertErr != nil {
-			return nil, nil, "", convertErr
-		}
-	}
-	isSQLType := storageType.isSQLType(&destination)
-	enrichAndLogMappings(destinationID, isSQLType, uniqueIDField, newStyleMapping)
-	fieldMapper, sqlTypes, err := schema.NewFieldMapper(newStyleMapping)
-	if err != nil {
-		return nil, nil, "", err
-	}
-
-	var flattener schema.Flattener
-	var typeResolver schema.TypeResolver
-	if isSQLType {
-		flattener = schema.NewFlattener()
-		typeResolver = schema.NewTypeResolver()
-	} else {
-		flattener = schema.NewDummyFlattener()
-		typeResolver = schema.NewDummyTypeResolver()
-	}
-
-	maxColumnNameLength, _ := maxColumnNameLengthByDestinationType[destination.Type]
-
-	processor, err = schema.NewProcessor(destinationID, &destination, isSQLType, tableName, fieldMapper, enrichmentRules, flattener, typeResolver, uniqueIDField, maxColumnNameLength)
-	if err != nil {
-		return nil, nil, "", err
-	}
-	//for telemetry
-	if len(oldStyleMappings) > 0 {
-		mappingsStyle = "old"
-	} else if newStyleMapping != nil {
-		mappingsStyle = "new"
-	}
-	return processor, sqlTypes, mappingsStyle, nil
 }
 
 //initializeRetroactiveUsersRecognition initializes recognition configuration (overrides global one with destination layer)
@@ -335,24 +233,28 @@ func (f *FactoryImpl) initializeRetroactiveUsersRecognition(destinationID string
 		if destination.UsersRecognition != nil {
 			logging.Errorf("[%s] Users recognition requires 'meta.storage' configuration", destinationID)
 		}
-		return &UserRecognitionConfiguration{enabled: false}, nil
+		return &UserRecognitionConfiguration{Enabled: false}, nil
+	}
+
+	URSetup, ok := UserRecognitionStorages[destination.Type]
+	if !ok {
+		return &UserRecognitionConfiguration{Enabled: false}, nil
 	}
 
 	//validates or overrides with the global one
 	if destination.UsersRecognition != nil {
+		if destination.UsersRecognition.IsEnabled() && !f.globalConfiguration.IsEnabled() {
+			return nil, fmt.Errorf("Error enabling user recognition for destination %s. Global user recognition configuration must be enabled first. Please add global user_recognition.enabled: true", destinationID)
+		}
 		//partly overriding
-		if destination.UsersRecognition.UserIDNode == "" {
-			destination.UsersRecognition.UserIDNode = f.globalConfiguration.UserIDNode
+		if destination.UsersRecognition.UserIDNode != "" ||
+			len(destination.UsersRecognition.IdentificationNodes) > 0 ||
+			destination.UsersRecognition.AnonymousIDNode != "" {
+			logging.Errorf("@@@@ [%s] Configuring Users Recognition ID nodes no longer supported on destination level!\n@@@@ Please set id nodes on global level: https://jitsu.com/docs/other-features/retroactive-user-recognition", destinationID)
 		}
-		if len(destination.UsersRecognition.IdentificationNodes) == 0 {
-			destination.UsersRecognition.IdentificationNodes = f.globalConfiguration.IdentificationNodes
-		}
-		if destination.UsersRecognition.AnonymousIDNode == "" {
-			destination.UsersRecognition.AnonymousIDNode = f.globalConfiguration.AnonymousIDNode
-		}
-		if err := destination.UsersRecognition.Validate(); err != nil {
-			return nil, fmt.Errorf("Error validating destination users_recognition configuration: %v", err)
-		}
+		destination.UsersRecognition.UserIDNode = f.globalConfiguration.UserIDNode
+		destination.UsersRecognition.IdentificationNodes = f.globalConfiguration.IdentificationNodes
+		destination.UsersRecognition.AnonymousIDNode = f.globalConfiguration.AnonymousIDNode
 	} else {
 		//completely overriding
 		destination.UsersRecognition = f.globalConfiguration
@@ -360,13 +262,13 @@ func (f *FactoryImpl) initializeRetroactiveUsersRecognition(destinationID string
 
 	//disabled
 	if !destination.UsersRecognition.IsEnabled() {
-		return &UserRecognitionConfiguration{enabled: false}, nil
+		return &UserRecognitionConfiguration{Enabled: false}, nil
 	}
 
 	//check primary fields
-	if (destination.Type == PostgresType || destination.Type == RedshiftType || destination.Type == SnowflakeType) && len(pkFields) == 0 {
-		logging.Errorf("[%s] retroactive users recognition is disabled: primary_key_fields must be configured (otherwise data duplication will occurred)", destinationID)
-		return &UserRecognitionConfiguration{enabled: false}, nil
+	if URSetup.PKRequired && len(pkFields) == 0 {
+		logging.Errorf("[%s] Retroactive Users Recognition was DISABLED: primary_key_fields must be configured (otherwise data duplication will occurred)", destinationID)
+		return &UserRecognitionConfiguration{Enabled: false}, nil
 	}
 
 	logging.Infof("[%s] configured retroactive users recognition", destinationID)
@@ -378,7 +280,7 @@ func (f *FactoryImpl) initializeRetroactiveUsersRecognition(destinationID string
 	}
 
 	return &UserRecognitionConfiguration{
-		enabled:                  destination.UsersRecognition.IsEnabled(),
+		Enabled:                  destination.UsersRecognition.IsEnabled(),
 		AnonymousIDJSONPath:      jsonutils.NewJSONPath(destination.UsersRecognition.AnonymousIDNode),
 		IdentificationJSONPathes: jsonutils.NewJSONPaths(destination.UsersRecognition.IdentificationNodes),
 	}, nil

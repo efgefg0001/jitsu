@@ -13,6 +13,8 @@ import (
 	"strings"
 )
 
+var ErrNoUserExist = errors.New("no users exist")
+
 type Provider interface {
 	//both authorization types
 	io.Closer
@@ -27,8 +29,10 @@ type Provider interface {
 	GetUserByID(userID string) (*User, error)
 	GetUserByEmail(email string) (*User, error)
 	SaveUser(user *User) error
+	GetOnlyUserID() (string, error)
+	ChangeUserEmail(oldEmail, newEmail string) (string, error)
 	CreateTokens(userID string) (*TokenDetails, error)
-	DeleteToken(token string) error
+	DeleteAccessToken(token string) error
 	DeleteAllTokens(userID string) error
 	SavePasswordResetID(resetID, userID string) error
 	DeletePasswordResetID(resetID string) error
@@ -167,14 +171,25 @@ func (fp *FirebaseProvider) SaveUser(user *User) error {
 	return errors.New(errMsg)
 }
 
+func (fp *FirebaseProvider) GetOnlyUserID() (string, error) {
+	errMsg := fmt.Sprintf("GetOnlyUserID() isn't supported in authorization FirebaseProvider.")
+	return "", errors.New(errMsg)
+}
+
+func (fp *FirebaseProvider) ChangeUserEmail(oldEmail, newEmail string) (string, error) {
+	errMsg := fmt.Sprintf("ChangeUserEmail isn't supported in authorization FirebaseProvider. old email: %s", oldEmail)
+	logging.SystemError(errMsg)
+	return "", errors.New(errMsg)
+}
+
 func (fp *FirebaseProvider) CreateTokens(userID string) (*TokenDetails, error) {
 	errMsg := fmt.Sprintf("CreateTokens isn't supported in authorization FirebaseProvider. userID: %s", userID)
 	logging.SystemError(errMsg)
 	return nil, errors.New(errMsg)
 }
 
-func (fp *FirebaseProvider) DeleteToken(token string) error {
-	errMsg := "DeleteToken isn't supported in authorization FirebaseProvider"
+func (fp *FirebaseProvider) DeleteAccessToken(token string) error {
+	errMsg := "DeleteAccessToken isn't supported in authorization FirebaseProvider"
 	logging.SystemError(errMsg)
 	return errors.New(errMsg)
 }

@@ -13,7 +13,7 @@ import (
 )
 
 func dryRun(payload events.Event, processor *schema.Processor, tableHelper *TableHelper) ([][]adapters.TableField, error) {
-	envelops, err := processor.ProcessEvent(payload)
+	envelops, err := processor.ProcessEvent(payload, true)
 	if err != nil {
 		return nil, err
 	}
@@ -38,18 +38,19 @@ func IsConnectionError(err error) bool {
 		strings.Contains(err.Error(), "write: broken pipe") ||
 		strings.Contains(err.Error(), "context deadline exceeded") ||
 		strings.Contains(err.Error(), "connection reset by peer") ||
-		strings.Contains(err.Error(), "write: connection timed out")
+		strings.Contains(err.Error(), "timed out") ||
+		strings.Contains(err.Error(), "no such host")
 }
 
 // syncStoreImpl implements common behaviour used to storing chunk of pulled data to any storages with processing
-func syncStoreImpl(storage Storage, overriddenDataSchema *schema.BatchHeader, objects []map[string]interface{}, timeIntervalValue string, cacheTable bool) error {
+func syncStoreImpl(storage Storage, overriddenDataSchema *schema.BatchHeader, objects []map[string]interface{}, timeIntervalValue string, cacheTable bool, needCopyEvent bool) error {
 	if len(objects) == 0 {
 		return nil
 	}
 
 	adapter, tableHelper := storage.getAdapters()
 
-	flatDataPerTable, err := processData(storage, overriddenDataSchema, objects, timeIntervalValue)
+	flatDataPerTable, err := processData(storage, overriddenDataSchema, objects, timeIntervalValue, needCopyEvent)
 	if err != nil {
 		return err
 	}
@@ -65,7 +66,7 @@ func syncStoreImpl(storage Storage, overriddenDataSchema *schema.BatchHeader, ob
 		}
 
 		start := timestamp.Now()
-		if err = adapter.BulkUpdate(dbSchema, flatData.GetPayload(), deleteConditions); err != nil {
+		if err = adapter.Insert(adapters.NewBatchInsertContext(dbSchema, flatData.GetPayload(), deleteConditions)); err != nil {
 			return err
 		}
 		logging.Debugf("[%s] Inserted [%d] rows in [%.2f] seconds", storage.ID(), flatData.GetPayloadLen(), timestamp.Now().Sub(start).Seconds())
@@ -80,7 +81,7 @@ func cleanImpl(storage Storage, tableName string) error {
 	return adapter.Truncate(tableName)
 }
 
-func processData(storage Storage, overriddenDataSchema *schema.BatchHeader, objects []map[string]interface{}, timeIntervalValue string) (map[string]*schema.ProcessedFile, error) {
+func processData(storage Storage, overriddenDataSchema *schema.BatchHeader, objects []map[string]interface{}, timeIntervalValue string, needCopyEvent bool) (map[string]*schema.ProcessedFile, error) {
 	processor := storage.Processor()
 	if processor == nil {
 		return nil, fmt.Errorf("Storage '%v' of '%v' type was badly configured", storage.ID(), storage.Type())
@@ -102,7 +103,7 @@ func processData(storage Storage, overriddenDataSchema *schema.BatchHeader, obje
 	}
 
 	//Update call with single object or bulk uploading
-	flatDataPerTable, failedEvents, _, err := processor.ProcessEvents(timeIntervalValue, objects, map[string]bool{})
+	flatDataPerTable, _, failedEvents, _, err := processor.ProcessEvents(timeIntervalValue, objects, map[string]bool{}, needCopyEvent)
 	if err != nil {
 		return nil, err
 	}

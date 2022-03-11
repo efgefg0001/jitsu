@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
+
 	"github.com/jitsucom/jitsu/server/appconfig"
 	"github.com/jitsucom/jitsu/server/config"
 	"github.com/jitsucom/jitsu/server/enrichment"
@@ -15,10 +17,22 @@ import (
 	"github.com/jitsucom/jitsu/server/templates"
 	"github.com/jitsucom/jitsu/server/timestamp"
 	"github.com/jitsucom/jitsu/server/uuid"
-	"strings"
 )
 
 var ErrSkipObject = errors.New("Transform or table name filter marked object to be skipped. This object will be skipped.")
+
+const (
+	JitsuEnvelopParameter    = "JITSU_ENVELOP"
+	JitsuUserRecognizedEvent = "JITSU_UR_EVENT"
+)
+
+var (
+	EventSpecialParameters = []string{
+		templates.TableNameParameter,
+		JitsuEnvelopParameter,
+		JitsuUserRecognizedEvent,
+	}
+)
 
 //go:embed segment.js
 var segmentTransform string
@@ -34,8 +48,8 @@ type Processor struct {
 	isSQLType               bool
 	tableNameExtractor      *TableNameExtractor
 	lookupEnrichmentStep    *enrichment.LookupEnrichmentStep
-	transformer             *templates.JsTemplateExecutor
-	builtinTransformer      *templates.JsTemplateExecutor
+	transformer             *templates.V8TemplateExecutor
+	builtinTransformer      *templates.V8TemplateExecutor
 	fieldMapper             events.Mapper
 	pulledEventsfieldMapper events.Mapper
 	typeResolver            TypeResolver
@@ -48,10 +62,12 @@ type Processor struct {
 	javaScripts             []string
 	jsVariables             map[string]interface{}
 	//indicate that we didn't forget to init JavaScript transform
-	transformInitialized bool
+	transformInitialized   bool
+	MappingStyle           string
+	userRecognitionEnabled bool
 }
 
-func NewProcessor(destinationID string, destinationConfig *config.DestinationConfig, isSQLType bool, tableNameFuncExpression string, fieldMapper events.Mapper, enrichmentRules []enrichment.Rule, flattener Flattener, typeResolver TypeResolver, uniqueIDField *identifiers.UniqueID, maxColumnNameLen int) (*Processor, error) {
+func NewProcessor(destinationID string, destinationConfig *config.DestinationConfig, isSQLType bool, tableNameFuncExpression string, fieldMapper events.Mapper, enrichmentRules []enrichment.Rule, flattener Flattener, typeResolver TypeResolver, uniqueIDField *identifiers.UniqueID, maxColumnNameLen int, mappingStyle string, userRecognitionEnabled bool) (*Processor, error) {
 	return &Processor{
 		identifier:              destinationID,
 		destinationConfig:       destinationConfig,
@@ -67,32 +83,40 @@ func NewProcessor(destinationID string, destinationConfig *config.DestinationCon
 		tableNameFuncExpression: tableNameFuncExpression,
 		javaScripts:             []string{},
 		jsVariables:             map[string]interface{}{},
+		MappingStyle:            mappingStyle,
+		userRecognitionEnabled:  userRecognitionEnabled,
 	}, nil
 }
 
 //ProcessEvent returns table representation, processed flatten object
-func (p *Processor) ProcessEvent(event map[string]interface{}) ([]Envelope, error) {
+func (p *Processor) ProcessEvent(event map[string]interface{}, needCopyEvent bool) ([]Envelope, error) {
 	if !p.transformInitialized {
 		err := fmt.Errorf("Destination: %s Attempt to use processor without running InitJavaScriptTemplates first", p.identifier)
 		return nil, err
 	}
-	return p.processObject(event, map[string]bool{})
+	return p.processObject(event, map[string]bool{}, needCopyEvent)
 }
 
 //ProcessEvents processes events objects
 //returns array of processed objects per table like {"table1": []objects, "table2": []objects},
 //All failed events are moved to separate collection for sending to fallback
-func (p *Processor) ProcessEvents(fileName string, objects []map[string]interface{}, alreadyUploadedTables map[string]bool) (map[string]*ProcessedFile, *events.FailedEvents, *events.SkippedEvents, error) {
+func (p *Processor) ProcessEvents(fileName string, objects []map[string]interface{}, alreadyUploadedTables map[string]bool, needCopyEvent bool) (flatData map[string]*ProcessedFile, recognizedFlatData map[string]*ProcessedFile, failedEvents *events.FailedEvents, skippedEvents *events.SkippedEvents, err error) {
 	if !p.transformInitialized {
 		err := fmt.Errorf("Destination: %s Attempt to use processor without running InitJavaScriptTemplates first", p.identifier)
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-	skippedEvents := &events.SkippedEvents{}
-	failedEvents := events.NewFailedEvents()
-	filePerTable := map[string]*ProcessedFile{}
+	skippedEvents = &events.SkippedEvents{}
+	failedEvents = events.NewFailedEvents()
+	flatData = map[string]*ProcessedFile{}
+	recognizedFlatData = map[string]*ProcessedFile{}
 
 	for _, event := range objects {
-		envelops, err := p.processObject(event, alreadyUploadedTables)
+		_, recognizedEvent := event[JitsuUserRecognizedEvent]
+		if recognizedEvent && !p.userRecognitionEnabled {
+			//skip recognized event for storages with disabled/not supported UR
+			continue
+		}
+		envelops, err := p.processObject(event, alreadyUploadedTables, needCopyEvent)
 		if err != nil {
 			//handle skip object functionality
 			if err == ErrSkipObject {
@@ -100,19 +124,18 @@ func (p *Processor) ProcessEvents(fileName string, objects []map[string]interfac
 				if !appconfig.Instance.DisableSkipEventsWarn {
 					logging.Warnf("[%s] Event [%s]: %v", p.identifier, eventID, err)
 				}
-
-				skippedEvents.Events = append(skippedEvents.Events, &events.SkippedEvent{EventID: eventID, Error: ErrSkipObject.Error()})
+				skippedEvents.Events = append(skippedEvents.Events, &events.SkippedEvent{EventID: eventID, Error: ErrSkipObject.Error(), RecognizedEvent: recognizedEvent})
 			} else if p.breakOnError {
-				return nil, nil, nil, err
+				return nil, nil, nil, nil, err
 			} else {
 				eventBytes, _ := json.Marshal(event)
 
 				logging.Warnf("Unable to process object %s: %v. This line will be stored in fallback.", string(eventBytes), err)
-
 				failedEvents.Events = append(failedEvents.Events, &events.FailedEvent{
-					Event:   eventBytes,
-					Error:   err.Error(),
-					EventID: p.uniqueIDField.Extract(event),
+					Event:           eventBytes,
+					Error:           err.Error(),
+					EventID:         p.uniqueIDField.Extract(event),
+					RecognizedEvent: recognizedEvent,
 				})
 				failedEvents.Src[events.ExtractSrc(event)]++
 			}
@@ -122,13 +145,20 @@ func (p *Processor) ProcessEvents(fileName string, objects []map[string]interfac
 			batchHeader := envelop.Header
 			processedObject := envelop.Event
 			if batchHeader.Exists() {
-				f, ok := filePerTable[batchHeader.TableName]
+				var fData map[string]*ProcessedFile
+				if recognizedEvent {
+					fData = recognizedFlatData
+				} else {
+					fData = flatData
+				}
+				f, ok := fData[batchHeader.TableName]
 				if !ok {
-					filePerTable[batchHeader.TableName] = &ProcessedFile{
-						FileName:    fileName,
-						BatchHeader: batchHeader,
-						payload:     []map[string]interface{}{processedObject},
-						eventsSrc:   map[string]int{events.ExtractSrc(event): 1},
+					fData[batchHeader.TableName] = &ProcessedFile{
+						FileName:           fileName,
+						BatchHeader:        batchHeader,
+						RecognitionPayload: recognizedEvent,
+						payload:            []map[string]interface{}{processedObject},
+						eventsSrc:          map[string]int{events.ExtractSrc(event): 1},
 					}
 				} else {
 					f.BatchHeader.Fields.Merge(batchHeader.Fields)
@@ -139,7 +169,7 @@ func (p *Processor) ProcessEvents(fileName string, objects []map[string]interfac
 		}
 	}
 
-	return filePerTable, failedEvents, skippedEvents, nil
+	return flatData, recognizedFlatData, failedEvents, skippedEvents, nil
 }
 
 //ProcessPulledEvents processes events objects without applying mapping rules
@@ -196,9 +226,15 @@ func (p *Processor) ProcessPulledEvents(tableName string, objects []map[string]i
 //1. extract table name
 //2. execute enrichment.LookupEnrichmentStep and Mapping
 //or ErrSkipObject/another error
-func (p *Processor) processObject(object map[string]interface{}, alreadyUploadedTables map[string]bool) ([]Envelope, error) {
-	objectCopy := maputils.CopyMap(object)
-	tableName, err := p.tableNameExtractor.Extract(objectCopy)
+func (p *Processor) processObject(object map[string]interface{}, alreadyUploadedTables map[string]bool, needCopyEvent bool) ([]Envelope, error) {
+	var workingObject map[string]interface{}
+	if needCopyEvent {
+		//we need to copy event when more that one storage can process the same event in parallel
+		workingObject = maputils.CopyMap(object)
+	} else {
+		workingObject = object
+	}
+	tableName, err := p.tableNameExtractor.Extract(workingObject)
 	if err != nil {
 		return nil, err
 	}
@@ -206,8 +242,8 @@ func (p *Processor) processObject(object map[string]interface{}, alreadyUploaded
 		return nil, ErrSkipObject
 	}
 
-	p.lookupEnrichmentStep.Execute(objectCopy)
-	mappedObject, err := p.fieldMapper.Map(objectCopy)
+	p.lookupEnrichmentStep.Execute(workingObject)
+	mappedObject, err := p.fieldMapper.Map(workingObject)
 	if err != nil {
 		return nil, fmt.Errorf("Error mapping object: %v", err)
 	}
@@ -264,6 +300,7 @@ func (p *Processor) processObject(object map[string]interface{}, alreadyUploaded
 		if newUniqueId == "" {
 			newUniqueId = uuid.New()
 		}
+		delete(prObject, JitsuUserRecognizedEvent)
 		if i > 0 {
 			//for event cache one to many mapping
 			newUniqueId = fmt.Sprintf("%s_%d", newUniqueId, i)
@@ -271,7 +308,7 @@ func (p *Processor) processObject(object map[string]interface{}, alreadyUploaded
 		}
 		if p.isSQLType {
 			prObject[p.uniqueIDField.GetFlatFieldName()] = newUniqueId
-			prObject[timestamp.Key] = object[timestamp.Key]
+			prObject[timestamp.Key] = workingObject[timestamp.Key]
 			if _, ok := object[timestamp.Key]; !ok {
 				prObject[timestamp.Key] = timestamp.NowUTC()
 			}
@@ -354,7 +391,7 @@ func (p *Processor) SetDefaultUserTransform(defaultUserTransform string) {
 }
 
 //SetBuiltinTransformer javascript executor for builtin js code (e.g. npm destination)
-func (p *Processor) SetBuiltinTransformer(builtinTransformer *templates.JsTemplateExecutor) {
+func (p *Processor) SetBuiltinTransformer(builtinTransformer *templates.V8TemplateExecutor) {
 	p.builtinTransformer = builtinTransformer
 }
 
@@ -377,7 +414,7 @@ func (p *Processor) InitJavaScriptTemplates() (err error) {
 	templateVariables = templates.EnrichedFuncMap(templateVariables)
 	tableNameExtractor, err := NewTableNameExtractor(p.tableNameFuncExpression, templateVariables)
 	if err != nil {
-		return err
+		return
 	}
 	p.tableNameExtractor = tableNameExtractor
 	p.AddJavaScriptVariables(templateVariables)
@@ -418,13 +455,9 @@ Mapping feature is deprecated. It is recommended to migrate to javascript data t
 	if userTransform != "" {
 		if strings.Contains(userTransform, "toSegment") {
 			//seems like built-in to segment transformation is used. We need to load script
-			segment, err := templates.Babelize(segmentTransform)
-			if err != nil {
-				return fmt.Errorf("failed to init transform segment.js: %v", err)
-			}
-			p.AddJavaScript(segment)
+			p.AddJavaScript(segmentTransform)
 		}
-		transformer, err := templates.NewJsTemplateExecutor(userTransform, p.jsVariables, p.javaScripts...)
+		transformer, err := templates.NewV8TemplateExecutor(userTransform, p.jsVariables, p.javaScripts...)
 		if err != nil {
 			return fmt.Errorf("failed to init transform javascript: %v", err)
 		}
@@ -445,8 +478,12 @@ func (p *Processor) CloseJavaScriptTemplates() {
 	}
 }
 
-func (p *Processor) GetTransformer() *templates.JsTemplateExecutor {
+func (p *Processor) GetTransformer() *templates.V8TemplateExecutor {
 	return p.transformer
+}
+
+func (p *Processor) DestinationType() string {
+	return p.destinationConfig.Type
 }
 
 func (p *Processor) Close() {

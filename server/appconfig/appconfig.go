@@ -14,7 +14,10 @@ import (
 	"github.com/spf13/viper"
 )
 
-const emptyGIFOnexOne = "R0lGODlhAQABAIAAAAAAAP8AACH5BAEAAAEALAAAAAABAAEAAAICTAEAOw=="
+const (
+	emptyGIFOnexOne       = "R0lGODlhAQABAIAAAAAAAP8AACH5BAEAAAEALAAAAAABAAEAAAICTAEAOw=="
+	localAirbyteConfigDir = "./airbyte_config"
+)
 
 //AppConfig is a main Application Global Configuration
 type AppConfig struct {
@@ -39,7 +42,8 @@ type AppConfig struct {
 
 	GlobalUniqueIDField *identifiers.UniqueID
 
-	closeMe []io.Closer
+	closeMe     []io.Closer
+	lastCloseMe []io.Closer
 
 	eventsConsumers []io.Closer
 	writeAheadLog   io.Closer
@@ -58,7 +62,6 @@ func setDefaultParams(containerized bool) {
 	viper.SetDefault("server.name", "unnamed-server")
 	viper.SetDefault("server.port", "8001")
 	viper.SetDefault("server.log.level", "info")
-	viper.SetDefault("server.static_files_dir", "./web")
 	viper.SetDefault("server.auth_reload_sec", 1)
 	viper.SetDefault("server.api_keys_reload_sec", 1)
 	viper.SetDefault("server.destinations_reload_sec", 1)
@@ -77,6 +80,7 @@ func setDefaultParams(containerized bool) {
 	viper.SetDefault("server.cache.pool.size", 10)
 	viper.SetDefault("server.strict_auth_tokens", false)
 	viper.SetDefault("server.max_columns", 100)
+	viper.SetDefault("server.max_event_size", 51200)
 	viper.SetDefault("server.configurator_urn", "/configurator")
 	//unique IDs
 	viper.SetDefault("server.fields_configuration.unique_id_field", "/eventn_ctx/event_id||/eventn_ctx_event_id||/event_id")
@@ -101,8 +105,9 @@ func setDefaultParams(containerized bool) {
 
 	viper.SetDefault("users_recognition.enabled", false)
 	viper.SetDefault("users_recognition.anonymous_id_node", "/eventn_ctx/user/anonymous_id||/user/anonymous_id||/eventn_ctx/user/hashed_anonymous_id||/user/hashed_anonymous_id")
-	viper.SetDefault("users_recognition.identification_nodes", []string{"/eventn_ctx/user/internal_id||/user/internal_id"})
+	viper.SetDefault("users_recognition.identification_nodes", []string{"/eventn_ctx/user/id||/user/id", "/eventn_ctx/user/email||/user/email", "/eventn_ctx/user/internal_id||/user/internal_id"}) // internal_id is DEPRECATED and is set for backward compatibility
 	viper.SetDefault("users_recognition.pool.size", 10)
+	viper.SetDefault("users_recognition.cache_ttl_min", 180)
 
 	viper.SetDefault("singer-bridge.python", "python3")
 	viper.SetDefault("singer-bridge.install_taps", true)
@@ -116,8 +121,6 @@ func setDefaultParams(containerized bool) {
 	viper.SetDefault("airbyte-bridge.log.rotation_min", "1440")
 	viper.SetDefault("airbyte-bridge.log.max_backups", "30") //30 days = 1440 min * 30
 	viper.SetDefault("airbyte-bridge.batch_size", 10_000)
-
-	viper.SetDefault("server.volumes.workspace", "jitsu_workspace")
 
 	//User Recognition anonymous events default TTL 10080 min - 7 days
 	viper.SetDefault("meta.storage.redis.ttl_minutes.anonymous_events", 10080)
@@ -141,6 +144,7 @@ func setDefaultParams(containerized bool) {
 		"/anonymousId -> /user/anonymous_id",
 		"/userId -> /ids/ajs_user_id",
 		"/userId -> /user/internal_id",
+		"/userId -> /user/id",
 		"/context/campaign -> /utm",
 		"/context/campaign/name -> /utm/campaign",
 		"/campaign ->",
@@ -211,6 +215,8 @@ func setDefaultParams(containerized bool) {
 	})
 
 	if containerized {
+		viper.SetDefault("server.static_files_dir", "/home/eventnative/app/web")
+
 		viper.SetDefault("log.path", "/home/eventnative/data/logs/events")
 		viper.SetDefault("server.log.path", "/home/eventnative/data/logs")
 		viper.SetDefault("server.config.path", "/home/eventnative/data/config")
@@ -221,7 +227,10 @@ func setDefaultParams(containerized bool) {
 		viper.SetDefault("airbyte-bridge.config_dir", "/home/eventnative/data/airbyte")
 		viper.SetDefault("sql_debug_log.ddl.path", "/home/eventnative/data/logs")
 		viper.SetDefault("sql_debug_log.queries.path", "/home/eventnative/data/logs")
+		viper.SetDefault("server.volumes.workspace", "jitsu_workspace")
 	} else {
+		viper.SetDefault("server.static_files_dir", "./web")
+
 		viper.SetDefault("log.path", "./logs/events")
 		viper.SetDefault("server.log.path", "./logs")
 		viper.SetDefault("sql_debug_log.ddl.path", "./logs")
@@ -231,7 +240,8 @@ func setDefaultParams(containerized bool) {
 		viper.SetDefault("singer-bridge.venv_dir", "./venv")
 		viper.SetDefault("singer-bridge.log.path", "./logs")
 		viper.SetDefault("airbyte-bridge.log.path", "./logs")
-		viper.SetDefault("airbyte-bridge.config_dir", "./airbyte_config")
+		viper.SetDefault("airbyte-bridge.config_dir", localAirbyteConfigDir)
+		viper.SetDefault("server.volumes.workspace", localAirbyteConfigDir) //should be the same as airbyte-bridge.config_dir
 	}
 }
 
@@ -395,5 +405,19 @@ func (a *AppConfig) ScheduleWriteAheadLogClosing(c io.Closer) {
 func (a *AppConfig) CloseWriteAheadLog() {
 	if err := a.writeAheadLog.Close(); err != nil {
 		logging.Errorf("[WriteAheadLog] %v", err)
+	}
+}
+
+//ScheduleLastClosing adds meta.Storage, coordinationService closers
+func (a *AppConfig) ScheduleLastClosing(c io.Closer) {
+	a.lastCloseMe = append(a.lastCloseMe, c)
+}
+
+//CloseLast closes meta.Storage, coordinationService closers in the last call
+func (a *AppConfig) CloseLast() {
+	for _, cl := range a.lastCloseMe {
+		if err := cl.Close(); err != nil {
+			logging.Error(err)
+		}
 	}
 }
