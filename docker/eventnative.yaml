@@ -7,6 +7,10 @@ server:
   telemetry: '${env.TELEMETRY_URL|}'
   cache:
     enabled: '${env.EVENTS_CACHE_ENABLED|true}'
+  metrics:
+    relay:
+      disabled: '${env.JITSU_EXTENDED_TELEMETRY_DISABLED|false}'
+      deployment_id: '${env.JITSU_EXTENDED_TELEMETRY_DEPLOYMENT_ID|}'
 
 geo:
   maxmind_path: '${env.MAX_MIND_PATH|}'
@@ -28,6 +32,9 @@ system: '${env.SYSTEM_URL|}'
 notifications:
   slack:
     url: '${env.SLACK_NOTIFICATIONS_WEBHOOK|}'
+
+ui:
+  base_url: '${env.JITSU_UI_BASE_URL|}'
 
 users_recognition:
   enabled: '${env.USER_RECOGNITION_ENABLED|false}'

@@ -5,20 +5,21 @@ import (
 	"compress/gzip"
 	"errors"
 	"fmt"
+	"io/ioutil"
+	"mime/multipart"
+	"net/http"
+
 	"github.com/gin-gonic/gin"
 	"github.com/jitsucom/jitsu/server/appconfig"
 	"github.com/jitsucom/jitsu/server/counters"
 	"github.com/jitsucom/jitsu/server/destinations"
 	"github.com/jitsucom/jitsu/server/enrichment"
 	"github.com/jitsucom/jitsu/server/events"
+	"github.com/jitsucom/jitsu/server/fallback"
 	"github.com/jitsucom/jitsu/server/metrics"
 	"github.com/jitsucom/jitsu/server/middleware"
-	"github.com/jitsucom/jitsu/server/parsers"
 	"github.com/jitsucom/jitsu/server/storages"
 	"github.com/jitsucom/jitsu/server/telemetry"
-	"io/ioutil"
-	"mime/multipart"
-	"net/http"
 )
 
 //BulkHandler is used for accepting bulk events requests from server 2 server integrations (CLI)
@@ -46,6 +47,8 @@ func (bh *BulkHandler) BulkLoadingHandler(c *gin.Context) {
 		return
 	}
 
+	needCopyEvent := len(storageProxies) > 1
+
 	eventObjects, err := extractBulkEvents(c)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, middleware.ErrResponse(err.Error(), nil))
@@ -62,10 +65,10 @@ func (bh *BulkHandler) BulkLoadingHandler(c *gin.Context) {
 	rowsCount := len(eventObjects)
 
 	for _, storageProxy := range storageProxies {
-		if err := bh.upload(storageProxy, eventObjects); err != nil {
+		if err := bh.upload(storageProxy, eventObjects, needCopyEvent); err != nil {
 
-			metrics.ErrorSourceEvents(tokenID, storageProxy.ID(), rowsCount)
-			metrics.ErrorObjects(tokenID, rowsCount)
+			metrics.ErrorTokenEvents(tokenID, storageProxy.Type(), storageProxy.ID(), rowsCount)
+			metrics.ErrorTokenObjects(tokenID, rowsCount)
 			telemetry.Error(tokenID, storageProxy.ID(), events.SrcBulk, "", rowsCount)
 			counters.ErrorPushDestinationEvents(storageProxy.ID(), int64(rowsCount))
 
@@ -73,8 +76,8 @@ func (bh *BulkHandler) BulkLoadingHandler(c *gin.Context) {
 			return
 		}
 
-		metrics.SuccessSourceEvents(tokenID, storageProxy.ID(), rowsCount)
-		metrics.SuccessObjects(tokenID, rowsCount)
+		metrics.SuccessTokenEvents(tokenID, storageProxy.Type(), storageProxy.ID(), rowsCount)
+		metrics.SuccessTokenObjects(tokenID, rowsCount)
 		telemetry.Event(tokenID, storageProxy.ID(), events.SrcBulk, "", rowsCount)
 		counters.SuccessPushDestinationEvents(storageProxy.ID(), int64(rowsCount))
 	}
@@ -101,20 +104,17 @@ func extractBulkEvents(c *gin.Context) ([]map[string]interface{}, error) {
 		return nil, fmt.Errorf("failed to read payload from input file: %v", err)
 	}
 
-	parserFunc := parsers.ParseJSON
-	if c.Query("fallback") == "true" {
-		parserFunc = parsers.ParseFallbackJSON
-	}
-
-	objects, err := parsers.ParseJSONFileWithFunc(payload, parserFunc)
+	fallbackRequest := c.Query("fallback") == "true"
+	skipMalformed := c.Query("skip_malformed") == "true"
+	objects, err := fallback.ExtractEvents(payload, !fallbackRequest, skipMalformed)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse JSON payload from input file: %v", err)
+		return nil, fmt.Errorf("failed to parse JSON payload: %v", err)
 	}
 
 	return objects, nil
 }
 
-func (bh *BulkHandler) upload(storageProxy storages.StorageProxy, objects []map[string]interface{}) error {
+func (bh *BulkHandler) upload(storageProxy storages.StorageProxy, objects []map[string]interface{}, needCopyEvent bool) error {
 	storage, ok := storageProxy.Get()
 	if !ok {
 		return fmt.Errorf("Destination [%s] hasn't been initialized yet", storage.ID())
@@ -124,7 +124,7 @@ func (bh *BulkHandler) upload(storageProxy storages.StorageProxy, objects []map[
 			"cannot be used to store data (only available for dry-run)", storage.ID())
 	}
 
-	return storage.SyncStore(nil, objects, "", true)
+	return storage.SyncStore(nil, objects, "", true, needCopyEvent)
 }
 
 //readFileBytes reads file from form data and returns byte payload or err if occurred

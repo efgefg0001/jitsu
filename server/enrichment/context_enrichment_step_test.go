@@ -137,7 +137,7 @@ func TestWithAPIPreprocess(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			jsPreprocessor := events.NewAPIProcessor()
+			jsPreprocessor := events.NewAPIProcessor(&events.DummyRecognition{})
 
 			ContextEnrichmentStep(tt.input, "token", tt.request, jsPreprocessor, appconfig.Instance.GlobalUniqueIDField)
 
@@ -150,4 +150,5 @@ func SetTestDefaultParams() {
 	viper.Set("log.path", "")
 	viper.Set("server.auth", `{"tokens":[{"id":"id1","client_secret":"c2stoken","server_secret":"s2stoken","origins":["whiteorigin*"]}]}`)
 	viper.Set("server.log.path", "")
+	viper.Set("sql_debug_log.ddl.enabled", false)
 }

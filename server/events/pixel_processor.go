@@ -104,7 +104,7 @@ func (pp *PixelProcessor) Preprocess(event Event, reqContext *RequestContext) {
 	event[SrcKey] = "jitsu_gif"
 }
 
-func (pp *PixelProcessor) Postprocess(event Event, eventID string, destinationIDs []string) {
+func (pp *PixelProcessor) Postprocess(event Event, eventID string, destinationIDs []string, tokenID string) {
 }
 
 // Type returns preprocessor type
@@ -115,6 +115,6 @@ func (pp *PixelProcessor) Type() string {
 //setIfNotExist uses JSONPath SetIfNotExist func and log error if occurred
 func (pp *PixelProcessor) setIfNotExist(path jsonutils.JSONPath, event Event, value interface{}) {
 	if err := path.SetIfNotExist(event, value); err != nil {
-		logging.Errorf("Error setting %v into event %s by path %s: %v", value, event.Serialize(), path.String(), err)
+		logging.Errorf("Error setting %v into event %s by path %s: %v", value, event.DebugString(), path.String(), err)
 	}
 }

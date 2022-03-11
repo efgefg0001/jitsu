@@ -3,6 +3,7 @@ package testsuit
 import (
 	"context"
 	"github.com/jitsucom/jitsu/server/config"
+	"github.com/jitsucom/jitsu/server/coordination"
 	"github.com/jitsucom/jitsu/server/logevents"
 	"github.com/jitsucom/jitsu/server/timestamp"
 	"net/http"
@@ -12,7 +13,6 @@ import (
 
 	"github.com/jitsucom/jitsu/server/appconfig"
 	"github.com/jitsucom/jitsu/server/caching"
-	"github.com/jitsucom/jitsu/server/coordination"
 	"github.com/jitsucom/jitsu/server/destinations"
 	"github.com/jitsucom/jitsu/server/enrichment"
 	"github.com/jitsucom/jitsu/server/events"
@@ -120,12 +120,13 @@ func NewSuiteBuilder(t *testing.T) SuiteBuilder {
 		UserIDNode:          viper.GetString("users_recognition.user_id_node"),
 		PoolSize:            viper.GetInt("users_recognition.pool.size"),
 		Compression:         viper.GetString("users_recognition.compression"),
+		CacheTTLMin:         viper.GetInt("users_recognition.cache_ttl_min"),
 	}
 
 	err = globalRecognitionConfiguration.Validate()
 	require.NoError(t, err)
 
-	dummyRecognitionService, _ := users.NewRecognitionService(&users.Dummy{}, nil, nil)
+	dummyRecognitionService, _ := users.NewRecognitionService(&users.Dummy{}, nil, nil, "/eventn_ctx/user_agent||/user_agent")
 
 	systemService := system.NewService("")
 
@@ -175,7 +176,7 @@ func (sb *suiteBuilder) WithMetaStorage(t *testing.T) SuiteBuilder {
 
 //WithDestinationService overrides destinations.Service with input data configured
 func (sb *suiteBuilder) WithDestinationService(t *testing.T, destinationConfig string) SuiteBuilder {
-	monitor := coordination.NewInMemoryService([]string{})
+	monitor := coordination.NewInMemoryService("")
 	tempDir := os.TempDir()
 	loggerFactory := logevents.NewFactory(tempDir, 5, false, nil, nil, false, 1)
 	queueFactory := events.NewQueueFactory(nil, 0)
@@ -194,7 +195,7 @@ func (sb *suiteBuilder) WithUserRecognition(t *testing.T) SuiteBuilder {
 	storage, err := users.InitializeStorage(true, viper.Sub("meta.storage"))
 	require.NoError(t, err)
 
-	usersRecognitionService, err := users.NewRecognitionService(storage, sb.destinationService, sb.globalUsersRecognitionConfig)
+	usersRecognitionService, err := users.NewRecognitionService(storage, sb.destinationService, sb.globalUsersRecognitionConfig, "/eventn_ctx/user_agent||/user_agent")
 	require.NoError(t, err)
 	appconfig.Instance.ScheduleClosing(usersRecognitionService)
 
@@ -207,7 +208,7 @@ func (sb *suiteBuilder) WithUserRecognition(t *testing.T) SuiteBuilder {
 //performs ping check before return
 func (sb *suiteBuilder) Build(t *testing.T) Suit {
 	//event processors
-	apiProcessor := events.NewAPIProcessor()
+	apiProcessor := events.NewAPIProcessor(sb.recognitionService)
 	bulkProcessor := events.NewBulkProcessor()
 	jsProcessor := events.NewJsProcessor(sb.recognitionService, viper.GetString("server.fields_configuration.user_agent_path"))
 	pixelProcessor := events.NewPixelProcessor()
@@ -219,8 +220,8 @@ func (sb *suiteBuilder) Build(t *testing.T) Suit {
 	appconfig.Instance.ScheduleWriteAheadLogClosing(walService)
 
 	router := routers.SetupRouter("", sb.metaStorage, sb.destinationService, sources.NewTestService(), synchronization.NewTestTaskService(),
-		fallback.NewTestService(), coordination.NewInMemoryService([]string{}), sb.eventsCache, sb.systemService,
-		sb.segmentRequestFieldsMapper, sb.segmentCompatRequestFieldsMapper, processorHolder, multiplexingService, walService, sb.geoService, nil)
+		fallback.NewTestService(), coordination.NewInMemoryService(""), sb.eventsCache, sb.systemService,
+		sb.segmentRequestFieldsMapper, sb.segmentCompatRequestFieldsMapper, processorHolder, multiplexingService, walService, sb.geoService, nil, sb.globalUsersRecognitionConfig)
 
 	server := &http.Server{
 		Addr:              sb.httpAuthority,

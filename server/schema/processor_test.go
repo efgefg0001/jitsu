@@ -22,6 +22,7 @@ import (
 
 func TestProcessFilePayload(t *testing.T) {
 	viper.Set("server.log.path", "")
+	viper.Set("sql_debug_log.ddl.enabled", false)
 
 	err := appconfig.Init(false, "")
 	require.NoError(t, err)
@@ -112,7 +113,7 @@ func TestProcessFilePayload(t *testing.T) {
 		},
 		{
 			"Input fallback file",
-			parsers.ParseFallbackJSON,
+			events.ParseFallbackJSON,
 			"../test_data/fallback_fact_input.log",
 			map[string]*ProcessedFile{
 				"user_2020_08": {FileName: "testfile", payload: []map[string]interface{}{
@@ -145,7 +146,7 @@ func TestProcessFilePayload(t *testing.T) {
 	}
 	destination := &config.DestinationConfig{Type: "google_analytics", BreakOnError: false,
 		DataLayout: &config.DataLayout{Transform: ""}}
-	p, err := NewProcessor("test", destination, false, `{{if .event_type}}{{if eq .event_type "skipped"}}{{else}}{{.event_type}}_{{._timestamp.Format "2006_01"}}{{end}}{{else}}{{.event_type}}_{{._timestamp.Format "2006_01"}}{{end}}`, &DummyMapper{}, []enrichment.Rule{}, NewFlattener(), NewTypeResolver(), identifiers.NewUniqueID("/eventn_ctx/event_id"), 0)
+	p, err := NewProcessor("test", destination, false, `{{if .event_type}}{{if eq .event_type "skipped"}}{{else}}{{.event_type}}_{{._timestamp.Format "2006_01"}}{{end}}{{else}}{{.event_type}}_{{._timestamp.Format "2006_01"}}{{end}}`, &DummyMapper{}, []enrichment.Rule{}, NewFlattener(), NewTypeResolver(), identifiers.NewUniqueID("/eventn_ctx/event_id"), 0, "new", false)
 	require.NoError(t, err)
 	err = p.InitJavaScriptTemplates()
 	require.NoError(t, err)
@@ -157,7 +158,7 @@ func TestProcessFilePayload(t *testing.T) {
 			objects, err := parsers.ParseJSONFileWithFunc(fBytes, tt.parseFunc)
 			require.NoError(t, err)
 
-			actual, failed, skipped, err := p.ProcessEvents("testfile", objects, map[string]bool{})
+			actual, _, failed, skipped, err := p.ProcessEvents("testfile", objects, map[string]bool{}, false)
 			require.NoError(t, err)
 
 			if len(tt.expectedSkipped) > 0 {
@@ -194,6 +195,7 @@ func TestProcessFilePayload(t *testing.T) {
 
 func TestProcessFact(t *testing.T) {
 	viper.Set("server.log.path", "")
+	viper.Set("sql_debug_log.ddl.enabled", false)
 
 	err := appconfig.Init(false, "")
 	require.NoError(t, err)
@@ -302,7 +304,10 @@ func TestProcessFact(t *testing.T) {
 			"",
 		},
 	}
-	appconfig.Init(false, "")
+
+	err = appconfig.Init(false, "")
+	require.NoError(t, err)
+
 	appconfig.Instance.UaResolver = useragent.Mock{}
 	geoService := geo.NewTestService(geo.Mock{"10.10.10.10": geoDataMock})
 	uaRule, err := enrichment.NewRule(&enrichment.RuleConfig{
@@ -327,13 +332,13 @@ func TestProcessFact(t *testing.T) {
 
 	destination := &config.DestinationConfig{Type: "google_analytics", BreakOnError: false,
 		DataLayout: &config.DataLayout{Transform: ""}}
-	p, err := NewProcessor("test", destination, false, `events_{{._timestamp.Format "2006_01"}}`, fieldMapper, []enrichment.Rule{uaRule, ipRule}, NewFlattener(), NewTypeResolver(), identifiers.NewUniqueID("/eventn_ctx/event_id"), 20)
+	p, err := NewProcessor("test", destination, false, `events_{{._timestamp.Format "2006_01"}}`, fieldMapper, []enrichment.Rule{uaRule, ipRule}, NewFlattener(), NewTypeResolver(), identifiers.NewUniqueID("/eventn_ctx/event_id"), 20, "new", false)
 	require.NoError(t, err)
 	err = p.InitJavaScriptTemplates()
 	require.NoError(t, err)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			envelopes, err := p.ProcessEvent(tt.input)
+			envelopes, err := p.ProcessEvent(tt.input, false)
 
 			if tt.expectedErr != "" {
 				require.Error(t, err)
@@ -352,6 +357,7 @@ func TestProcessFact(t *testing.T) {
 
 func TestProcessTransform(t *testing.T) {
 	viper.Set("server.log.path", "")
+	viper.Set("sql_debug_log.ddl.enabled", false)
 
 	err := appconfig.Init(false, "")
 	require.NoError(t, err)
@@ -443,13 +449,13 @@ switch ($.event_type) {
 `
 	destination := &config.DestinationConfig{Type: "google_analytics", BreakOnError: false,
 		DataLayout: &config.DataLayout{Transform: transformExpression}}
-	p, err := NewProcessor("test", destination, false, `events`, fieldMapper, []enrichment.Rule{}, NewFlattener(), NewTypeResolver(), identifiers.NewUniqueID("/eventn_ctx/event_id"), 20)
+	p, err := NewProcessor("test", destination, false, `events`, fieldMapper, []enrichment.Rule{}, NewFlattener(), NewTypeResolver(), identifiers.NewUniqueID("/eventn_ctx/event_id"), 20, "new", false)
 	require.NoError(t, err)
 	err = p.InitJavaScriptTemplates()
 	require.NoError(t, err)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			envelopes, err := p.ProcessEvent(tt.input)
+			envelopes, err := p.ProcessEvent(tt.input, false)
 			if tt.expectedErr != "" {
 				require.Error(t, err)
 				require.Equal(t, tt.expectedErr, err.Error())
